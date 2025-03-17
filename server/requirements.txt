@@ -1,0 +1,10 @@
+flask
+flask-cors
+google-auth
+google-cloud-firestore
+requests
+snaptrade-python-sdk
+gunicorn
+google-genai
+google-adk
+pyjwt
