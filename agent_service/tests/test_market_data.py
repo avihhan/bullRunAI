@@ -1,0 +1,190 @@
+from datetime import date, timedelta
+
+import httpx
+import pytest
+
+from bullrun_agent import data_sources as ds
+from bullrun_agent.config import Settings
+
+
+@pytest.fixture(autouse=True)
+def clear_cache():
+    ds._cache.clear()
+    yield
+    ds._cache.clear()
+
+
+def live(**kw) -> Settings:
+    return Settings(polygon_api_key="test-key", allow_demo_data=False, **kw)
+
+
+def fake_polygon(calls: list, sessions: dict[date, dict]):
+    def _get(path, params, s):
+        calls.append(path)
+        day = date.fromisoformat(path.rsplit("/", 1)[1])
+        return {"results": [{"T": t, **bar} for t, bar in sessions.get(day, {}).items()]}
+    return _get
+
+
+def test_quote_uses_two_grouped_calls_for_any_number_of_tickers(monkeypatch):
+    today = date.today()
+    d1, d2 = today - timedelta(days=1), today - timedelta(days=2)
+    sessions = {
+        d1: {"NVDA": {"o": 100, "h": 106, "l": 99, "c": 105, "v": 10},
+             "AAPL": {"o": 200, "h": 201, "l": 195, "c": 196, "v": 5}},
+        d2: {"NVDA": {"o": 98, "h": 101, "l": 97, "c": 100, "v": 9},
+             "AAPL": {"o": 199, "h": 202, "l": 198, "c": 200, "v": 4}},
+    }
+    calls: list = []
+    monkeypatch.setattr(ds, "_polygon_get", fake_polygon(calls, sessions))
+    s = live()
+    nvda, aapl = ds.get_quote("nvda", s), ds.get_quote("AAPL", s)
+    assert nvda["price"] == 105 and nvda["change_pct"] == 5.0 and nvda["source"] == "polygon"
+    assert aapl["change_pct"] == -2.0
+    assert str(d1) in nvda["as_of"]
+    # today (empty) + d1 + d2, then everything else is served from cache
+    assert len(calls) == 3
+    ds.get_quote("NVDA", s)
+    assert len(calls) == 3
+
+
+def test_unknown_symbol_is_an_error_not_made_up(monkeypatch):
+    d1 = date.today() - timedelta(days=1)
+    bar = {"NVDA": {"o": 1, "h": 1, "l": 1, "c": 1}}
+    sessions = {d1: bar, d1 - timedelta(days=1): bar}
+    monkeypatch.setattr(ds, "_polygon_get", fake_polygon([], sessions))
+    out = ds.get_quote("ZZZZ", live())
+    assert "error" in out and "price" not in out
+
+
+def test_rate_limit_is_reported(monkeypatch):
+    def boom(path, params, s):
+        raise httpx.HTTPStatusError("429", request=httpx.Request("GET", "http://x"),
+                                    response=httpx.Response(429))
+    monkeypatch.setattr(ds, "_polygon_get", boom)
+    assert "rate limit" in ds.get_quote("NVDA", live())["error"]
+
+
+def test_strict_mode_never_returns_demo_data(monkeypatch):
+    s = Settings(polygon_api_key=None, allow_demo_data=False)
+    q = ds.get_quote("NVDA", s)
+    n = ds.get_news("NVDA", 3, s)
+    assert q["source"] == "none" and "price" not in q
+    assert n["articles"] == [] and n["source"] == "none"
+
+
+def test_strict_mode_portfolio_without_broker_is_empty(monkeypatch):
+    monkeypatch.setattr(ds, "get_settings", lambda: Settings(allow_demo_data=False))
+    ds.get_user_store.cache_clear()
+    out = ds.get_portfolio("nobody@example.com", Settings(allow_demo_data=False))
+    assert out["positions"] == [] and out["source"] == "none" and "brokerage" in out["note"]
+    ds.get_user_store.cache_clear()
+
+
+def test_manual_holdings_are_used_and_priced(monkeypatch):
+    class Store:
+        def get_user(self, email):
+            return {"watchlist": [], "manual_holdings": [{"symbol": "NVDA", "quantity": 10, "avgCost": 90}],
+                    "manual_cash": 500}
+    monkeypatch.setattr(ds, "get_user_store", lambda: Store())
+    monkeypatch.setattr(ds, "get_quote", lambda t, s=None: {"ticker": t, "price": 110.0, "change_pct": 1.5})
+    out = ds.get_portfolio("me@x.com", Settings(allow_demo_data=False, polygon_api_key="k"))
+    pos = out["positions"][0]
+    assert out["source"] == "manual" and out["cash"] == 500
+    assert pos["market_value"] == 1100.0 and pos["unrealized_pl_pct"] == 22.22
+    assert pos["weight_of_invested_pct"] == 100.0 and pos["weight_of_total_pct"] == 68.75
+    assert out["total_value"] == 1600.0
+
+
+class FakeResp:
+    def __init__(self, data, status=200):
+        self._data, self.status_code = data, status
+
+    def json(self):
+        return self._data
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("err", request=httpx.Request("GET", "http://x"),
+                                        response=httpx.Response(self.status_code))
+
+
+def test_finnhub_realtime_quote(monkeypatch):
+    q = {"c": 190.5, "o": 185, "h": 191, "l": 184.2, "pc": 185.0, "t": 1793300000}
+    monkeypatch.setattr(ds.httpx, "get", lambda *a, **k: FakeResp(q))
+    out = ds.get_quote("NVDA", Settings(finnhub_api_key="k", allow_demo_data=False))
+    assert out["source"] == "finnhub" and out["price"] == 190.5 and out["change_pct"] == 2.97
+    assert out["as_of"].endswith("ET")
+
+
+def test_finnhub_unknown_symbol(monkeypatch):
+    monkeypatch.setattr(ds.httpx, "get", lambda *a, **k: FakeResp({"c": 0, "t": 0}))
+    out = ds.get_quote("ZZZZ", Settings(finnhub_api_key="k", allow_demo_data=False))
+    assert "error" in out and "price" not in out
+
+
+def test_falls_back_to_polygon_when_finnhub_down(monkeypatch):
+    monkeypatch.setattr(ds.httpx, "get", lambda *a, **k: FakeResp({}, status=500))
+    d1 = date.today() - timedelta(days=1)
+    bar = {"NVDA": {"o": 1, "h": 2, "l": 1, "c": 2}}
+    monkeypatch.setattr(ds, "_polygon_get", fake_polygon([], {d1: bar, d1 - timedelta(days=1): bar}))
+    out = ds.get_quote("NVDA", Settings(finnhub_api_key="k", polygon_api_key="p", allow_demo_data=False))
+    assert out["source"] == "polygon" and out["price"] == 2
+
+
+def test_demo_brokerage_is_labelled(monkeypatch):
+    class Store:
+        def get_user(self, email):
+            return {"watchlist": [], "manual_holdings": [{"symbol": "NVDA", "quantity": 1, "avgCost": 100}],
+                    "demo_brokerage": {"institution": "Robinhood"}}
+    monkeypatch.setattr(ds, "get_user_store", lambda: Store())
+    monkeypatch.setattr(ds, "get_quote", lambda t, s=None: {"ticker": t, "price": 100.0, "change_pct": 0})
+    out = ds.get_portfolio("me@x.com", Settings(allow_demo_data=False, finnhub_api_key="k"))
+    accounts = {p["account"] for p in out["positions"]}
+    assert accounts == {"manual", "Robinhood (simulated demo account)"}
+    assert "simulated" in out["note"]
+
+
+def test_news_keeps_only_articles_about_the_company(monkeypatch):
+    def poly(path, params, s):
+        def art(title, desc, pub, ts, sentiment="neutral"):
+            ins = [{"ticker": "AAPL", "sentiment": sentiment, "sentiment_reasoning": "r"}]
+            return {"title": title, "description": desc, "publisher": {"name": pub}, "published_utc": ts,
+                    "article_url": f"https://x/{title[:10]}", "insights": ins}
+        return {"results": [
+            art("MP Materials Has Collapsed 60% From Its Highs", "Rare earths story.", "The Motley Fool",
+                "2026-11-01T12:33Z"),
+            art("Alphabet Gets Kicked Out of the $4 Trillion Club", "Falls behind Microsoft and Apple.",
+                "The Motley Fool",
+                "2026-11-01T12:15Z"),
+            art("Is Apple a Top Tech Stock to Buy Now?", "Valuation looks stretched.", "The Motley Fool",
+                "2026-10-31T17:30Z", "negative"),
+            art("Apple's Services Revenue Hits Record", "Strong quarter.", "The Motley Fool", "2026-10-30T10:00Z"),
+            art("3 Apple Stocks To Watch", "AAPL and peers.", "The Motley Fool", "2026-10-29T10:00Z"),
+        ]}
+    finnhub = [{"title": "Apple beats on iPhone sales", "publisher": "Reuters", "published_utc": "2026-10-31T21:00Z",
+                "description": "Apple Inc reported...", "url": "https://r/1"},
+               {"title": "IS APPLE A TOP TECH STOCK TO BUY NOW?", "publisher": "Yahoo",
+                "published_utc": "2026-10-31T18:00Z", "description": "dup", "url": "https://y/1"}]
+    monkeypatch.setattr(ds, "_polygon_get", poly)
+    monkeypatch.setattr(ds, "_finnhub_news", lambda t, s: finnhub)
+    monkeypatch.setattr(ds, "_company_name", lambda t, s: "Apple")
+
+    out = ds.get_news("AAPL", 5, live(finnhub_api_key="k"))
+    titles = [a["title"] for a in out["articles"]]
+    assert not any("MP Materials" in x for x in titles)          # only tagged, never mentions Apple
+    assert titles[0] == "Apple beats on iPhone sales"             # headline match, newest first, second source
+    assert "Alphabet Gets Kicked Out of the $4 Trillion Club" not in titles[:3]  # summary-only match ranks last
+    assert sum("buy now" in x.lower() for x in titles) == 1       # same story from two sources kept once
+    assert sum(a["publisher"] == "The Motley Fool" for a in out["articles"]) <= 2
+    svc = next(a for a in out["articles"] if a["title"].startswith("Apple's Services"))
+    assert svc["sentiment"] == "neutral" and svc["match"] == "headline"
+    assert out["source"] == "polygon+finnhub"
+
+
+def test_company_name_strips_suffixes(monkeypatch):
+    for raw, want in [("Apple Inc", "Apple"), ("Alphabet Inc Class A", "Alphabet"), ("NVIDIA Corp", "NVIDIA"),
+                      ("Microsoft Corporation", "Microsoft")]:
+        ds._cache.clear()
+        monkeypatch.setattr(ds, "_cached", lambda k, ttl, fn, raw=raw: raw)
+        assert ds._company_name("X", live(finnhub_api_key="k")) == want
